@@ -1,6 +1,6 @@
 use halo2_proofs::{
     arithmetic::Field,
-    circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
+    circuit::{AssignedCell, Cell, Layouter, SimpleFloorPlanner, Value},
     poly::{Rotation},
     plonk::{
         Advice, ConstraintSystem, Circuit, 
@@ -22,20 +22,22 @@ use std::marker::PhantomData;
     Since this defeats the purpose of hiding the values in the circuit wires, 
     it makes sense to keep z private (advice region) and k public (instance region) instead.
 •   
-•   This is what the table for the fib circuit would look like
+•   This is what the naive table for the fib circuit would look like
 •   if one were trying to prove that, given f(0) = 1 and f(1) = 1, 
 •   f(9) = 55.
 •   
 •   note how one would need to enforce copy constraints between c_i and b_i+1
 •   as the output of the current gate will be an input into the next gate.
 
-    a | b | c | s | i
-    ------------------
-    1   1   2   1   1
-    1   2   3   1   1
-    2   3   5   1   55
-    3   5   8   1
-    5   8   13  1
+    a | b | c | z | s | i
+    ----------------------
+    1   1   2   55  1   7
+    1   2   3   55  1   
+    2   3   5   55  1   
+    3   5   8   55  1
+    5   8   13  55  1
+
+•   A better version only puts f(k-2), f(k-1), and z in the table.
 
 */
 
@@ -90,8 +92,8 @@ impl<F: Field> FibChip<F>{
         •   the closure here creates the gate that uses the input
             from the advice columns to enforce the recursion constraints
 
-        •   Rotation::cur() and Rotation::next() control the relative positions
-            from which inputs/outputs to the constraints are chosen
+        •   Rotation::cur() and Rotation::next() control the positions relative to
+            the CURRENT REGION from which inputs/outputs to the constraints are chosen
         
         •   In every row of the advice region, we must have that a_i + b_i - c_i = 0
         */
@@ -123,20 +125,21 @@ impl<F: Field> FibChip<F>{
     •   Should break this down
     •   Assign first row of advice (x, y, z)
     •   Assign first row of instance (just k)
-    •   You can do whatever you want here, don't assume the existence
-        of nonexistent rules or constraints
     */
     fn assign_row(
         &self, 
         mut layouter: impl Layouter<F>, 
         a: Value<F>, 
         b: Value<F>, 
+        copy_cell: Option<AssignedCell<F, F>>,
+        z: Value<F>,
+        is_last: bool,
     ) -> Result<(AssignedCell<F, F>, AssignedCell<F, F>, AssignedCell<F, F>), Error> {
         //assign input a to region
         layouter.assign_region(
             || "first_row", //annotation
             |mut region| { //assignment 
-                self.config.selector.enable(&mut region, 0);
+                self.config.selector.enable(&mut region, 0)?;
                 /*
                 @note
                 •   Assign private values f_0, f_1, f_2 in the first advice row.
@@ -149,18 +152,39 @@ impl<F: Field> FibChip<F>{
                     0, //offset
                     || a //closure which outputs the value to assign
                 )?;
-                let b_cell = region.assign_advice(
-                    || "f_1",  //annotation
-                    self.config.advice[1], //column
-                    0, //offset
-                    || b //closure which outputs the value to assign
-                )?;
+                
+                let b_cell = if let Some(cc) = &copy_cell {
+                    cc.copy_advice(
+                        || "current result = prev input", //annotation
+                        &mut region, //region,
+                        self.config.advice[1], //column
+                        0, //offset
+                    )?
+                } else {
+                    region.assign_advice(
+                        || "f_1",  //annotation
+                        self.config.advice[1], //column
+                        0, //offset
+                        || b //closure which outputs the value to assign
+                    )?
+                };
+
+                /*
+                @note
+                •   In the last row, we need to check that f(k) = f(k-1) + f(k-2) = z.
+                •   We can do this by putting z in the cell instead of a + b
+                */
                 let c_cell = region.assign_advice(
                     || "f_2",  //annotation
                     self.config.advice[2], //column
                     0, //offset
-                    || a_cell.value().copied() + b_cell.value()
+                    || if !is_last {
+                        a_cell.value().copied() + b_cell.value()
+                    } else{
+                        z
+                    }
                 )?;
+
                 Ok((a_cell, b_cell, c_cell))
             }
         )
@@ -172,8 +196,8 @@ struct FibCircuit<F: Field>{
     //inputs to this circuit
     pub a: Value<F>,
     pub b: Value<F>,
-    pub c: Value<F>,
     pub k: Value<usize>,
+    pub z: Value<F>,
 }
 
 impl<F: Field> Circuit<F> for FibCircuit<F>{
@@ -195,19 +219,29 @@ impl<F: Field> Circuit<F> for FibCircuit<F>{
     fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error>{
         //create chip
         let fib_chip: FibChip<F> = FibChip::construct(config);
-        let mut fib0 = self.a.clone();
-        let mut fib1 = self.b.clone();
-        let mut fibtemp = self.b.clone();
-        let _ = self.k.map(|v| {
-            (0..v).map(|x| {
-                let _ = fib_chip.assign_row(
-                    layouter.namespace(||format!("assign f_{}, f_{}, f_{}", v, v+1, v+2)),
+        let mut fib0 = self.a;
+        let mut fib1 = self.b;
+        let mut fibtemp = self.b;
+        
+        //@note constrain first cell of instance col to equal k
+        
+        //layouter.constrain_instance(k_cell.cell(), self.config.instance, 0);
+
+        let mut copy_cell: Option<AssignedCell<F, F>> = None;
+        let result = self.k.map(|v| {
+            (0..v).for_each(|x| {
+                let (a_cell, b_cell, c_cell) = fib_chip.assign_row(
+                    layouter.namespace(||format!("assign f_{}, f_{}, f_{}", x, x+1, x+2)),
                     fib0,
                     fib1,
-                );
-                fibtemp = fib0;
-                fib0 = fib1;
+                    copy_cell.clone(),
+                    self.z,
+                    x == v-1
+                ).unwrap();
+                copy_cell = Some(c_cell);
+                fibtemp = fib1;
                 fib1 = fib0 + &fibtemp;
+                fib0 = fibtemp;
             });
         });
         Ok(())
@@ -220,11 +254,12 @@ mod tests{
     use halo2_proofs::{circuit::SimpleFloorPlanner, pasta::Fp, dev::MockProver};
 
     #[test]
-    fn test_sound(){
-
-    }
-    
     fn test_complete(){
 
     }
+
+    #[test]
+    fn test_sound(){
+    }
+    
 }
