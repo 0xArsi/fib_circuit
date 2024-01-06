@@ -5,7 +5,7 @@ use halo2_proofs::{
     plonk::{
         Advice, ConstraintSystem, Circuit, 
         Column, Fixed, Any, Error,
-        Instance, Selector, Expression,
+        Selector, Expression,
         VirtualCells,
     },
 };
@@ -50,7 +50,6 @@ use std::marker::PhantomData;
 pub struct FibConfig{
     advice: [Column<Advice>; 3],
     selector: Selector,
-    instance: Column<Instance>
 }
 
 /*
@@ -81,12 +80,10 @@ impl<F: Field> FibChip<F>{
         let col_a: Column<Advice> = advice[0];
         let col_b: Column<Advice> = advice[1];
         let col_c: Column<Advice> = advice[2];
-        let instance: Column<Instance> = cs.instance_column();
         let selector: Selector = cs.selector();
         cs.enable_equality(col_a);
         cs.enable_equality(col_b);
         cs.enable_equality(col_c);
-        cs.enable_equality(instance);
         /*
         @note
         •   the closure here creates the gate that uses the input
@@ -116,7 +113,6 @@ impl<F: Field> FibChip<F>{
         FibConfig{
             advice: [col_a, col_b, col_c],
             selector: selector,
-            instance: instance,
         }
     }
 
@@ -226,17 +222,17 @@ impl<F: Field> Circuit<F> for FibCircuit<F>{
         //@note constrain first cell of instance col to equal k
         
         //layouter.constrain_instance(k_cell.cell(), self.config.instance, 0);
-
         let mut copy_cell: Option<AssignedCell<F, F>> = None;
+        //@note since we get f(2) in the first row, we need k-1 iterations [0, v-1)
         let result = self.k.map(|v| {
-            (0..v).for_each(|x| {
+            (0..v-1).for_each(|x| {
                 let (a_cell, b_cell, c_cell) = fib_chip.assign_row(
                     layouter.namespace(||format!("assign f_{}, f_{}, f_{}", x, x+1, x+2)),
                     fib0,
                     fib1,
                     copy_cell.clone(),
                     self.z,
-                    x == v-1
+                    x == v-2
                 ).unwrap();
                 copy_cell = Some(c_cell);
                 fibtemp = fib1;
@@ -255,11 +251,40 @@ mod tests{
 
     #[test]
     fn test_complete(){
+        let test_a = Fp::from(1);
+        let test_b = Fp::from(2);
+        let test_k = 9_usize;
+        let test_z = Fp::from(89);
 
+        let circ = FibCircuit{
+            a: Value::<Fp>::known(test_a),
+            b: Value::<Fp>::known(test_b),
+            k: Value::<usize>::known(test_k),
+            z: Value::<Fp>::known(test_z),
+        };
+
+        let prover = MockProver::run(8, &circ, vec![]).unwrap();
+
+        assert_eq!(prover.verify(), Ok(()));
     }
 
     #[test]
+    #[should_panic]
     fn test_sound(){
+        let test_a = Fp::from(5);
+        let test_b = Fp::from(8);
+        let test_k = 11_usize;
+        let test_z = Fp::from(55);
+
+        let circ = FibCircuit{
+            a: Value::<Fp>::known(test_a),
+            b: Value::<Fp>::known(test_b),
+            k: Value::<usize>::known(test_k),
+            z: Value::<Fp>::known(test_z),
+        };
+
+        let prover = MockProver::run(8, &circ, vec![]).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
     }
     
 }
